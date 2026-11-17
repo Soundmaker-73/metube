@@ -8,6 +8,7 @@ MeTube is a self-hosted web UI for [yt-dlp](https://github.com/yt-dlp/yt-dlp). P
 * Video, audio, subtitles and thumbnails — from single videos, whole playlists or entire channels.
 * [Subscriptions](https://github.com/alexta69/metube/wiki/Subscriptions) to channels and playlists, which queue new uploads as they appear.
 * Per-download choices of quality, format and folder, plus server-wide [yt-dlp options and presets](https://github.com/alexta69/metube/wiki/yt-dlp-options).
+* **Multi-user support** — user accounts and administration, personal workspaces (queue, history, subscriptions), and isolated download directories.
 
 📖 **Guides, recipes and a troubleshooting FAQ live in the [wiki](https://github.com/alexta69/metube/wiki)** — many feature requests are already a recipe there, so check it before filing one.
 
@@ -16,7 +17,7 @@ MeTube is a self-hosted web UI for [yt-dlp](https://github.com/yt-dlp/yt-dlp). P
 ## Quick start
 
 ```bash
-docker run -d -p 8081:8081 -v /path/to/downloads:/downloads ghcr.io/alexta69/metube
+docker run -d -p 8081:8081 -v /path/to/downloads:/downloads -e AUTH_ENABLED=true ghcr.io/soundmaker-73/metube
 ```
 
 Or with Docker Compose:
@@ -24,16 +25,21 @@ Or with Docker Compose:
 ```yaml
 services:
   metube:
-    image: ghcr.io/alexta69/metube
+    build: .
+    image: ghcr.io/soundmaker-73/metube:latest
     container_name: metube
     restart: unless-stopped
     ports:
       - "8081:8081"
     volumes:
       - /path/to/downloads:/downloads
+    environment:
+      - AUTH_ENABLED=true
+      - ADMIN_USER=admin
+      - ADMIN_PASSWORD=admin
 ```
 
-Then open `http://<host>:8081` in your browser. Images are multi-arch (amd64/arm64), and also published on Docker Hub as `alexta69/metube`.
+Then open `http://<host>:8081` in your browser. Images are multi-arch (amd64/arm64).
 
 ## Configuration
 
@@ -54,7 +60,7 @@ MeTube is configured with environment variables: `-e NAME=value` on the `docker 
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `AUTH_ENABLED` | `true` | Enable multi-user authentication with isolated user spaces and private download directories. Set to `false` for open single-user mode. |
+| `AUTH_ENABLED` | `true` | Enable multi-user authentication with isolated user spaces and private download directories — [details](https://github.com/Soundmaker-73/MeTube/blob/master/docs/MULTIUSER.md). Set to `false` for open single-user mode. |
 | `ADMIN_USER` | | Initial admin username to bootstrap on startup when auth is enabled. |
 | `ADMIN_PASSWORD` | | Initial admin password to bootstrap on startup when auth is enabled. |
 

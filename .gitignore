@@ -50,6 +50,12 @@ Thumbs.db
 /queue*
 /completed*
 /pending*
+/users*
+/sessions*
+/subscriptions*
+/cookies*
 
 __pycache__
 .venv
+.pytest_cache/
+downloads/
