@@ -40,6 +40,7 @@ class DownloadOptions:
     sponsorblock: bool = False
     audio_tags: str = 'with_cover'
     video_password: Optional[str] = field(default=None, repr=False)
+    user: str = ''
 
     def __post_init__(self):
         # Own copies, so neither the caller's list/dict nor a later mutation

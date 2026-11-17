@@ -555,10 +555,10 @@ class DownloadQueueNotifier:
     async def completed(self, dl):
         raise NotImplementedError
 
-    async def canceled(self, id):
+    async def canceled(self, id, user=None):
         raise NotImplementedError
 
-    async def cleared(self, id):
+    async def cleared(self, id, user=None):
         raise NotImplementedError
 
 # What a stored DownloadInfo gets for a field it does not carry: records
@@ -573,6 +573,7 @@ _DOWNLOAD_INFO_DEFAULTS: dict[str, Any] = {
     "sponsorblock": False,
     "audio_tags": "with_cover",
     "video_password": None,
+    "user": "",
     "chapter_template": "",
     "subtitle_language": "en",
     "subtitle_mode": "prefer_manual",
@@ -622,6 +623,7 @@ class DownloadInfo:
         sponsorblock=False,
         audio_tags='with_cover',
         video_password=None,
+        user="",
     ):
         self.id = id if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{id}'
         self.title = title if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{title}'
@@ -650,6 +652,7 @@ class DownloadInfo:
         self.sponsorblock = sponsorblock
         self.audio_tags = audio_tags
         self.video_password = video_password
+        self.user = user
         self.chapter_template = chapter_template
         self.subtitle_language = subtitle_language
         self.subtitle_mode = subtitle_mode
@@ -761,6 +764,7 @@ _PERSISTED_DOWNLOAD_FIELDS = (
     "filename",
     "size",
     "chapter_files",
+    "user",
 )
 
 
@@ -1716,7 +1720,11 @@ class DownloadQueue:
         if self.queue.exists(download.info.url):
             await self.queue.delete(download.info.url)
             if download.canceled:
-                bg_tasks.create_task(self.notifier.canceled(download.info.url), name="notify_canceled")
+                user = getattr(download.info, 'user', None)
+                if user:
+                    bg_tasks.create_task(self.notifier.canceled(download.info.url, user=user), name="notify_canceled")
+                else:
+                    bg_tasks.create_task(self.notifier.canceled(download.info.url), name="notify_canceled")
             else:
                 await self.done.put(download)
                 bg_tasks.create_task(self.notifier.completed(download.info), name="notify_completed")
@@ -1787,8 +1795,11 @@ class DownloadQueue:
             params['impersonate'] = yt_dlp.networking.impersonate.ImpersonateTarget.from_str(imp)
         return yt_dlp.YoutubeDL(params=params).extract_info(url, download=False)
 
-    def __calc_download_path(self, download_type, folder):
+    def __calc_download_path(self, download_type, folder, user=None):
         base_directory = self.config.AUDIO_DOWNLOAD_DIR if download_type == 'audio' else self.config.DOWNLOAD_DIR
+        if user:
+            base_directory = os.path.join(base_directory, _sanitize_path_component(user))
+            os.makedirs(base_directory, exist_ok=True)
         if folder:
             if not self.config.CUSTOM_DIRS:
                 return None, {'status': 'error', 'msg': 'A folder for the download was specified but CUSTOM_DIRS is not true in the configuration.'}
@@ -1807,7 +1818,7 @@ class DownloadQueue:
         return dldirectory, None
 
     async def __add_download(self, dl, auto_start):
-        dldirectory, error_message = self.__calc_download_path(dl.download_type, dl.folder)
+        dldirectory, error_message = self.__calc_download_path(dl.download_type, dl.folder, user=getattr(dl, 'user', None))
         if error_message is not None:
             return error_message
         output = self.config.OUTPUT_TEMPLATE
@@ -1857,7 +1868,7 @@ class DownloadQueue:
         await self.notifier.added(dl)
 
     def __write_feed_metadata_sync(self, entry, etype, download_type, folder,
-                                   ytdl_options_presets, ytdl_options_overrides, video_password=None):
+                                   ytdl_options_presets, ytdl_options_overrides, video_password=None, user=None):
         """Write the feed-level .info.json/description/thumbnail for a playlist
         or channel add, using the same output template its items will use.
 
@@ -1881,7 +1892,7 @@ class DownloadQueue:
         if user_opts.get('allow_playlist_files') is False:
             return
 
-        dldirectory, error_message = self.__calc_download_path(download_type, folder)
+        dldirectory, error_message = self.__calc_download_path(download_type, folder, user=user)
         if error_message is not None:
             return
 
@@ -1937,6 +1948,7 @@ class DownloadQueue:
                 partial(
                     self.__write_feed_metadata_sync, entry, etype, options.download_type, options.folder,
                     options.ytdl_options_presets, options.ytdl_options_overrides, options.video_password,
+                    getattr(options, 'user', None),
                 ),
             )
         except Exception as exc:
@@ -2119,11 +2131,13 @@ class DownloadQueue:
             entry = {**entry, **copy.deepcopy(retry_context)}
         return await self.__add_entry(entry, options, already, _add_gen, retry_entry)
 
-    async def retry(self, id):
+    async def retry(self, id, for_user=None):
         if not self.done.exists(id):
             return {'status': 'error', 'msg': 'Failed download no longer exists.'}
 
         info = self.done.get(id).info
+        if for_user is not None and getattr(info, 'user', '') and getattr(info, 'user', '') != for_user:
+            return {'status': 'error', 'msg': 'Permission denied.'}
         if info.status != 'error':
             return {'status': 'error', 'msg': 'Only failed downloads can be retried.'}
 
@@ -2147,10 +2161,12 @@ class DownloadQueue:
         normalized_entry = copy.deepcopy(entry) if isinstance(entry, dict) else entry
         return await self.__add_entry(normalized_entry, options, set(), None)
 
-    async def start_pending(self, ids):
+    async def start_pending(self, ids, for_user=None):
         for id in ids:
             if self.pending.exists(id):
                 dl = self.pending.get(id)
+                if for_user is not None and getattr(dl.info, 'user', '') and getattr(dl.info, 'user', '') != for_user:
+                    continue
                 await self.pending.delete(id)
                 if getattr(dl.info, 'live_status', None) == 'is_upcoming':
                     await self._schedule_upcoming_download(dl)
@@ -2166,13 +2182,15 @@ class DownloadQueue:
                 continue
             if self.queue.exists(id):
                 dl = self.queue.get(id)
+                if for_user is not None and getattr(dl.info, 'user', '') and getattr(dl.info, 'user', '') != for_user:
+                    continue
                 if dl.info.status == 'scheduled':
                     self._force_start_scheduled(dl)
                 continue
             log.warning(f'requested start for non-existent download {id}')
         return {'status': 'ok'}
 
-    async def cancel(self, ids):
+    async def cancel(self, ids, for_user=None):
         for id in ids:
             # Track URL so an add still expanding a playlist won't re-queue it.
             # Only while one is running: with none in flight there is nothing
@@ -2181,24 +2199,37 @@ class DownloadQueue:
             if self._adds_in_flight:
                 self._canceled_urls.add(id)
             if self.pending.exists(id):
+                dl = self.pending.get(id)
+                if for_user is not None and getattr(dl.info, 'user', '') and getattr(dl.info, 'user', '') != for_user:
+                    continue
+                user = getattr(dl.info, 'user', None)
                 await self.pending.delete(id)
-                await self.notifier.canceled(id)
+                if user:
+                    await self.notifier.canceled(id, user=user)
+                else:
+                    await self.notifier.canceled(id)
                 continue
             if not self.queue.exists(id):
                 log.warning(f'requested cancel for non-existent download {id}')
                 continue
             dl = self.queue.get(id)
+            if for_user is not None and getattr(dl.info, 'user', '') and getattr(dl.info, 'user', '') != for_user:
+                continue
             if dl.info.status == 'scheduled':
                 self._unregister_scheduled(id)
             if dl.started():
                 dl.cancel()
             else:
                 dl.canceled = True
+                user = getattr(dl.info, 'user', None)
                 await self.queue.delete(id)
-                await self.notifier.canceled(id)
+                if user:
+                    await self.notifier.canceled(id, user=user)
+                else:
+                    await self.notifier.canceled(id)
         return {'status': 'ok'}
 
-    async def clear(self, ids, delete_files=False):
+    async def clear(self, ids, delete_files=False, for_user=None):
         # 'ask' only deletes files on an explicit user choice passed in via
         # delete_files; auto-clear and retry call clear() with no kwarg, so in
         # 'ask' mode those paths keep the files (there's nobody to ask).
@@ -2208,9 +2239,11 @@ class DownloadQueue:
             if not self.done.exists(id):
                 log.warning(f'requested delete for non-existent download {id}')
                 continue
+            dl = self.done.get(id)
+            if for_user is not None and getattr(dl.info, 'user', '') and getattr(dl.info, 'user', '') != for_user:
+                continue
             if should_delete:
-                dl = self.done.get(id)
-                dldirectory, calc_error = self.__calc_download_path(dl.info.download_type, dl.info.folder)
+                dldirectory, calc_error = self.__calc_download_path(dl.info.download_type, dl.info.folder, user=getattr(dl.info, 'user', None))
                 if calc_error is not None or not dldirectory:
                     log.warning(f'deleting files for download {id} skipped: could not resolve download directory')
                 else:
@@ -2237,11 +2270,19 @@ class DownloadQueue:
                             pass
                         except OSError as e:
                             log.warning(f'deleting file "{rel_name}" for download {id} failed with error message {e!r}')
+            user = getattr(dl.info, 'user', None)
             await self.done.delete(id)
-            await self.notifier.cleared(id)
+            if user:
+                await self.notifier.cleared(id, user=user)
+            else:
+                await self.notifier.cleared(id)
         return {'status': 'ok'}
 
-    def get(self):
+    def get(self, for_user=None):
+        if for_user is not None:
+            return (list((k, v.info) for k, v in self.queue.items() if getattr(v.info, 'user', '') == for_user) +
+                    list((k, v.info) for k, v in self.pending.items() if getattr(v.info, 'user', '') == for_user),
+                    list((k, v.info) for k, v in self.done.items() if getattr(v.info, 'user', '') == for_user))
         return (list((k, v.info) for k, v in self.queue.items()) +
                 list((k, v.info) for k, v in self.pending.items()),
                 list((k, v.info) for k, v in self.done.items()))

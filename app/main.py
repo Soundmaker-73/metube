@@ -16,6 +16,8 @@ import json
 import pathlib
 import re
 import time
+import html
+import urllib.parse
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from watchfiles import awatch
 
@@ -24,6 +26,7 @@ import format_catalog
 from ytdl import DownloadQueueNotifier, DownloadQueue, Download
 from download_options import DownloadOptions
 from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, browse_playlist, coerce_optional_bool
+from users import UserManager, SessionManager, User, validate_username
 from yt_dlp.version import __version__ as yt_dlp_version
 
 log = logging.getLogger('main')
@@ -111,9 +114,12 @@ class Config:
         'LOGLEVEL': 'INFO',
         'ENABLE_ACCESSLOG': 'false',
         'YTDL_NIGHTLY_UPDATE_TIME': '',
+        'AUTH_ENABLED': 'true',
+        'ADMIN_USER': '',
+        'ADMIN_PASSWORD': '',
     }
 
-    _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'HTTPS', 'ENABLE_ACCESSLOG', 'ALLOW_YTDL_OPTIONS_OVERRIDES', 'ALLOW_PRIVATE_ADDRESSES')
+    _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'HTTPS', 'ENABLE_ACCESSLOG', 'ALLOW_YTDL_OPTIONS_OVERRIDES', 'ALLOW_PRIVATE_ADDRESSES', 'AUTH_ENABLED')
 
     def __init__(self):
         for k, v in self._DEFAULTS.items():
@@ -296,6 +302,7 @@ class Config:
         'SUBSCRIPTION_DEFAULT_CHECK_INTERVAL',
         'ALLOW_YTDL_OPTIONS_OVERRIDES',
         'DELETE_FILE_ON_TRASHCAN',
+        'AUTH_ENABLED',
     )
 
     def frontend_safe(self) -> dict:
@@ -403,6 +410,117 @@ class ObjectSerializer(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 serializer = ObjectSerializer()
+
+user_mgr = UserManager(config.STATE_DIR)
+session_mgr = SessionManager(config.STATE_DIR)
+
+if config.AUTH_ENABLED and config.ADMIN_USER and config.ADMIN_PASSWORD:
+    user_mgr.bootstrap_admin(config.ADMIN_USER, config.ADMIN_PASSWORD)
+
+
+def _get_cookie_from_environ(environ, name):
+    raw = environ.get('HTTP_COOKIE', '')
+    if not raw:
+        return None
+    for part in raw.split(';'):
+        if '=' in part:
+            k, v = part.strip().split('=', 1)
+            if k == name:
+                return v
+    return None
+
+
+def get_authenticated_user(request: web.Request) -> Optional[User]:
+    if not config.AUTH_ENABLED:
+        return None
+    if 'user' in request:
+        return request['user']
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header[7:].strip()
+        user = session_mgr.get_user(token, user_mgr)
+        if user:
+            return user
+    cookie_token = request.cookies.get('metube_session')
+    if cookie_token:
+        user = session_mgr.get_user(cookie_token, user_mgr)
+        if user:
+            return user
+    return None
+
+
+def require_user(request: web.Request) -> User:
+    user = get_authenticated_user(request)
+    if not user:
+        raise web.HTTPUnauthorized(reason='Authentication required')
+    return user
+
+
+def require_admin(request: web.Request) -> User:
+    user = require_user(request)
+    if user.role != 'admin':
+        raise web.HTTPForbidden(reason='Admin role required')
+    return user
+
+
+def _set_auth_cookie(response: web.Response, token: str):
+    response.set_cookie(
+        'metube_session',
+        token,
+        path=config.URL_PREFIX,
+        httponly=True,
+        samesite='Lax',
+        secure=config.HTTPS,
+        max_age=30 * 86400,
+    )
+
+
+def _clear_auth_cookie(response: web.Response):
+    response.del_cookie('metube_session', path=config.URL_PREFIX)
+
+
+@web.middleware
+async def auth_middleware(request: web.Request, handler):
+    if not config.AUTH_ENABLED:
+        return await handler(request)
+
+    path = request.path
+    prefix = config.URL_PREFIX
+    rel_path = path[len(prefix):] if path.startswith(prefix) else path.lstrip('/')
+
+    # Whitelisted routes:
+    if (
+        rel_path in ('', 'robots.txt', 'version', 'api/auth/status', 'api/auth/login')
+        or (rel_path == 'api/auth/setup' and not user_mgr.has_users())
+        or rel_path.startswith('socket.io')
+        or request.method == 'OPTIONS'
+    ):
+        return await handler(request)
+
+    # UI static assets
+    ui_exts = ('.js', '.css', '.ico', '.png', '.jpg', '.jpeg', '.svg', '.woff', '.woff2', '.ttf', '.json')
+    if rel_path.endswith(ui_exts) and not rel_path.startswith(('download/', 'audio_download/')):
+        return await handler(request)
+
+    user = get_authenticated_user(request)
+    if not user:
+        if (
+            rel_path.startswith(('api/', 'download/', 'audio_download/'))
+            or rel_path in (
+                'add', 'browse', 'cancel-add', 'retry', 'subscribe',
+                'subscriptions', 'subscriptions/update', 'subscriptions/delete', 'subscriptions/check',
+                'delete', 'start', 'history', 'presets', 'cookie-status', 'upload-cookies', 'delete-cookies'
+            )
+        ):
+            raise web.HTTPUnauthorized(
+                text=serializer.encode({'status': 'error', 'msg': 'Authentication required'}),
+                content_type='application/json',
+            )
+        return web.HTTPFound(config.URL_PREFIX)
+
+    request['user'] = user
+    return await handler(request)
+
 
 _STATE_DIR_REAL = os.path.realpath(config.STATE_DIR)
 
@@ -532,7 +650,7 @@ def _socketio_origin_allowed(origin, environ):
     return False
 
 
-app = web.Application(middlewares=[cross_origin_guard, state_dir_guard])
+app = web.Application(middlewares=[cross_origin_guard, auth_middleware, state_dir_guard])
 _cors_origins = [o.strip() for o in config.CORS_ALLOWED_ORIGINS.split(',') if o.strip()] if config.CORS_ALLOWED_ORIGINS else []
 if '*' in _cors_origins and len(_cors_origins) > 1:
     log.warning(
@@ -762,23 +880,31 @@ def _migrate_legacy_request(post: dict) -> dict:
 class Notifier(DownloadQueueNotifier):
     async def added(self, dl):
         log.info(f"Notifier: Download added - {dl.title}")
-        await sio.emit('added', serializer.encode(dl))
+        user = getattr(dl, 'user', None)
+        room = f"user:{user}" if (config.AUTH_ENABLED and user) else None
+        await sio.emit('added', serializer.encode(dl), to=room)
 
     async def updated(self, dl):
         log.debug(f"Notifier: Download updated - {dl.title}")
-        await sio.emit('updated', serializer.encode(dl))
+        user = getattr(dl, 'user', None)
+        room = f"user:{user}" if (config.AUTH_ENABLED and user) else None
+        await sio.emit('updated', serializer.encode(dl), to=room)
 
     async def completed(self, dl):
         log.info(f"Notifier: Download completed - {dl.title}")
-        await sio.emit('completed', serializer.encode(dl))
+        user = getattr(dl, 'user', None)
+        room = f"user:{user}" if (config.AUTH_ENABLED and user) else None
+        await sio.emit('completed', serializer.encode(dl), to=room)
 
-    async def canceled(self, id):
+    async def canceled(self, id, user=None):
         log.info(f"Notifier: Download canceled - {id}")
-        await sio.emit('canceled', serializer.encode(id))
+        room = f"user:{user}" if (config.AUTH_ENABLED and user) else None
+        await sio.emit('canceled', serializer.encode(id), to=room)
 
-    async def cleared(self, id):
+    async def cleared(self, id, user=None):
         log.info(f"Notifier: Download cleared - {id}")
-        await sio.emit('cleared', serializer.encode(id))
+        room = f"user:{user}" if (config.AUTH_ENABLED and user) else None
+        await sio.emit('cleared', serializer.encode(id), to=room)
 
 dqueue = DownloadQueue(config, Notifier())
 
@@ -799,14 +925,17 @@ app.on_cleanup.append(_shutdown_download_manager)
 class MetubeSubscriptionNotifier(SubscriptionNotifier):
     async def subscription_added(self, sub: SubscriptionInfo):
         log.info("Subscription added: %s", sub.name)
-        await sio.emit('subscription_added', serializer.encode(sub.to_public_dict()))
+        room = f"user:{sub.user}" if (config.AUTH_ENABLED and sub.user) else None
+        await sio.emit('subscription_added', serializer.encode(sub.to_public_dict()), to=room)
 
     async def subscription_updated(self, sub: SubscriptionInfo):
-        await sio.emit('subscription_updated', serializer.encode(sub.to_public_dict()))
+        room = f"user:{sub.user}" if (config.AUTH_ENABLED and sub.user) else None
+        await sio.emit('subscription_updated', serializer.encode(sub.to_public_dict()), to=room)
 
-    async def subscription_removed(self, sub_id: str):
+    async def subscription_removed(self, sub_id: str, user: str = ""):
         log.info("Subscription removed: %s", sub_id)
-        await sio.emit('subscription_removed', serializer.encode(sub_id))
+        room = f"user:{user}" if (config.AUTH_ENABLED and user) else None
+        await sio.emit('subscription_removed', serializer.encode(sub_id), to=room)
 
     async def subscriptions_all(self, subs: list[SubscriptionInfo]):
         await sio.emit('subscriptions_all', serializer.encode([s.to_public_dict() for s in subs]))
@@ -1078,6 +1207,15 @@ def parse_download_options(post: dict) -> tuple[str, DownloadOptions]:
     )
 
 
+COOKIES_PATH = os.path.join(config.STATE_DIR, 'cookies.txt')
+
+
+def get_user_cookies_path(user: Optional[User]) -> str:
+    if config.AUTH_ENABLED and user:
+        return os.path.join(config.STATE_DIR, f'cookies_{user.username}.txt')
+    return COOKIES_PATH
+
+
 @routes.post(config.URL_PREFIX + 'add')
 async def add(request):
     log.info("Received request to add download")
@@ -1087,13 +1225,22 @@ async def add(request):
     except web.HTTPBadRequest as e:
         log.error("Bad request: %s", e.reason)
         raise
+    user = get_authenticated_user(request)
+    if config.AUTH_ENABLED and user:
+        options = options.replace(user=user.username)
+        user_cookie = get_user_cookies_path(user)
+        if os.path.exists(user_cookie) and 'cookiefile' not in options.ytdl_options_overrides:
+            options = options.replace(
+                ytdl_options_overrides={**options.ytdl_options_overrides, 'cookiefile': user_cookie}
+            )
     log.info(
-        "Add download request: type=%s quality=%s format=%s has_folder=%s auto_start=%s",
+        "Add download request: type=%s quality=%s format=%s has_folder=%s auto_start=%s user=%s",
         options.download_type,
         options.quality,
         options.format,
         bool(options.folder),
         options.auto_start,
+        options.user,
     )
     status = await dqueue.add(url, options)
     return web.Response(text=serializer.encode(status))
@@ -1148,7 +1295,12 @@ async def retry(request):
     # record only once it is confirmed re-queued. A batch form would have to
     # report per-id results for the caller to know which ones to remove.
     post = await _read_json_request(request)
-    status = await dqueue.retry(_require_id(post))
+    user = get_authenticated_user(request)
+    for_user = user.username if (config.AUTH_ENABLED and user and user.role != 'admin') else None
+    if config.AUTH_ENABLED and for_user:
+        status = await dqueue.retry(_require_id(post), for_user=for_user)
+    else:
+        status = await dqueue.retry(_require_id(post))
     return web.Response(text=serializer.encode(status), content_type='application/json')
 
 
@@ -1180,6 +1332,9 @@ async def subscribe(request):
     if not clip_given:
         options = options.replace(clip_start=None, clip_end=None)
 
+    user = get_authenticated_user(request)
+    sub_user = user.username if (config.AUTH_ENABLED and user) else ""
+
     result = await submgr.add_subscription(
         url,
         check_interval_minutes=cic,
@@ -1203,13 +1358,17 @@ async def subscribe(request):
         skip_subscriber_only=skip_subscriber_only,
         clip_start=options.clip_start,
         clip_end=options.clip_end,
+        user=sub_user,
     )
     return web.Response(text=serializer.encode(result))
 
 
 @routes.get(config.URL_PREFIX + 'subscriptions')
 async def subscriptions_list(request):
-    return web.Response(text=serializer.encode([s.to_public_dict() for s in submgr.list_all()]))
+    user = get_authenticated_user(request)
+    for_user = user.username if (config.AUTH_ENABLED and user) else None
+    subs = submgr.list_all(for_user=for_user) if (config.AUTH_ENABLED and for_user) else submgr.list_all()
+    return web.Response(text=serializer.encode([s.to_public_dict() for s in subs]))
 
 
 @routes.post(config.URL_PREFIX + 'subscriptions/update')
@@ -1226,8 +1385,13 @@ async def subscriptions_update(request):
     }
     if not changes:
         raise web.HTTPBadRequest(reason='no valid fields to update')
+    user = get_authenticated_user(request)
+    for_user = user.username if (config.AUTH_ENABLED and user and user.role != 'admin') else None
     log.info("Subscription update requested for %s: %s", sub_id, sorted(changes.keys()))
-    result = await submgr.update_subscription(str(sub_id), changes)
+    if config.AUTH_ENABLED and for_user:
+        result = await submgr.update_subscription(str(sub_id), changes, for_user=for_user)
+    else:
+        result = await submgr.update_subscription(str(sub_id), changes)
     return web.Response(text=serializer.encode(result))
 
 
@@ -1237,7 +1401,12 @@ async def subscriptions_delete(request):
     ids = post.get('ids')
     if not ids or not isinstance(ids, list):
         raise web.HTTPBadRequest(reason='missing ids list')
-    result = await submgr.delete_subscriptions([str(i) for i in ids])
+    user = get_authenticated_user(request)
+    for_user = user.username if (config.AUTH_ENABLED and user and user.role != 'admin') else None
+    if config.AUTH_ENABLED and for_user:
+        result = await submgr.delete_subscriptions([str(i) for i in ids], for_user=for_user)
+    else:
+        result = await submgr.delete_subscriptions([str(i) for i in ids])
     return web.Response(text=serializer.encode(result))
 
 
@@ -1247,8 +1416,13 @@ async def subscriptions_check(request):
     ids = post.get('ids')
     if ids is not None and not isinstance(ids, list):
         raise web.HTTPBadRequest(reason='ids must be a list')
+    user = get_authenticated_user(request)
+    for_user = user.username if (config.AUTH_ENABLED and user and user.role != 'admin') else None
     log.info("Subscription check-now requested for ids=%s", ids if ids else "all-enabled")
-    result = await submgr.check_now([str(i) for i in ids] if ids else None)
+    if config.AUTH_ENABLED and for_user:
+        result = await submgr.check_now([str(i) for i in ids] if ids else None, for_user=for_user)
+    else:
+        result = await submgr.check_now([str(i) for i in ids] if ids else None)
     return web.Response(text=serializer.encode(result))
 
 def _require_id(post: dict) -> str:
@@ -1276,7 +1450,12 @@ async def delete(request):
     delete_files = post.get('delete_files', False)
     if not isinstance(delete_files, bool):
         raise web.HTTPBadRequest(reason="'delete_files' must be a boolean")
-    status = await (dqueue.cancel(ids) if where == 'queue' else dqueue.clear(ids, delete_files=delete_files))
+    user = get_authenticated_user(request)
+    for_user = user.username if (config.AUTH_ENABLED and user and user.role != 'admin') else None
+    if config.AUTH_ENABLED and for_user:
+        status = await (dqueue.cancel(ids, for_user=for_user) if where == 'queue' else dqueue.clear(ids, delete_files=delete_files, for_user=for_user))
+    else:
+        status = await (dqueue.cancel(ids) if where == 'queue' else dqueue.clear(ids, delete_files=delete_files))
     log.info(f"Download delete request processed for ids: {ids}, where: {where}")
     return web.Response(text=serializer.encode(status))
 
@@ -1285,11 +1464,13 @@ async def start(request):
     post = await _read_json_request(request)
     ids = _require_id_list(post)
     log.info(f"Received request to start pending downloads for ids: {ids}")
-    status = await dqueue.start_pending(ids)
+    user = get_authenticated_user(request)
+    for_user = user.username if (config.AUTH_ENABLED and user and user.role != 'admin') else None
+    if config.AUTH_ENABLED and for_user:
+        status = await dqueue.start_pending(ids, for_user=for_user)
+    else:
+        status = await dqueue.start_pending(ids)
     return web.Response(text=serializer.encode(status))
-
-
-COOKIES_PATH = os.path.join(config.STATE_DIR, 'cookies.txt')
 
 
 def warn_if_cookiefile_shadowed():
@@ -1317,6 +1498,8 @@ def warn_if_cookiefile_shadowed():
 
 @routes.post(config.URL_PREFIX + 'upload-cookies')
 async def upload_cookies(request):
+    user = get_authenticated_user(request)
+    cookie_path = get_user_cookies_path(user)
     reader = await request.multipart()
     field = await reader.next()
     if field is None or field.name != 'cookies':
@@ -1334,7 +1517,7 @@ async def upload_cookies(request):
             return web.Response(status=400, text=serializer.encode({'status': 'error', 'msg': 'Cookie file too large (max 1MB)'}))
         content.extend(chunk)
 
-    tmp_cookie_path = f"{COOKIES_PATH}.tmp"
+    tmp_cookie_path = f"{cookie_path}.tmp"
     with open(tmp_cookie_path, 'wb') as f:
         f.write(content)
     # Cookies are sensitive auth material; restrict to owner read/write only
@@ -1343,65 +1526,84 @@ async def upload_cookies(request):
         os.chmod(tmp_cookie_path, 0o600)
     except OSError as exc:
         log.warning(f'Could not restrict permissions on cookies file: {exc}')
-    os.replace(tmp_cookie_path, COOKIES_PATH)
-    warn_if_cookiefile_shadowed()
-    config.set_runtime_override('cookiefile', COOKIES_PATH)
-    log.info(f'Cookies file uploaded ({size} bytes)')
+    os.replace(tmp_cookie_path, cookie_path)
+    if not (config.AUTH_ENABLED and user):
+        warn_if_cookiefile_shadowed()
+        config.set_runtime_override('cookiefile', cookie_path)
+    log.info(f'Cookies file uploaded ({size} bytes) for {user.username if user else "global"}')
     return web.Response(text=serializer.encode({'status': 'ok', 'msg': f'Cookies uploaded ({size} bytes)'}))
 
 @routes.post(config.URL_PREFIX + 'delete-cookies')
 async def delete_cookies(request):
-    has_uploaded_cookies = os.path.exists(COOKIES_PATH)
-    configured_cookiefile = config.YTDL_OPTIONS.get('cookiefile')
-    has_manual_cookiefile = isinstance(configured_cookiefile, str) and configured_cookiefile and configured_cookiefile != COOKIES_PATH
+    user = get_authenticated_user(request)
+    cookie_path = get_user_cookies_path(user)
+    has_uploaded_cookies = os.path.exists(cookie_path)
 
-    if not has_uploaded_cookies:
-        if has_manual_cookiefile:
-            return web.Response(
-                status=400,
-                text=serializer.encode({
-                    'status': 'error',
-                    'msg': 'Cookies are configured manually via YTDL_OPTIONS (cookiefile). Remove or change that setting manually; UI delete only removes uploaded cookies.'
-                })
-            )
-        return web.Response(status=400, text=serializer.encode({'status': 'error', 'msg': 'No uploaded cookies to delete'}))
+    if not (config.AUTH_ENABLED and user):
+        configured_cookiefile = config.YTDL_OPTIONS.get('cookiefile')
+        has_manual_cookiefile = isinstance(configured_cookiefile, str) and configured_cookiefile and configured_cookiefile != COOKIES_PATH
 
-    os.remove(COOKIES_PATH)
-    config.remove_runtime_override('cookiefile')
-    success, msg = config.load_ytdl_options()
-    if not success:
-        log.error(f'Cookies file deleted, but failed to reload YTDL_OPTIONS: {msg}')
-        return web.Response(status=500, text=serializer.encode({'status': 'error', 'msg': f'Cookies file deleted, but failed to reload YTDL_OPTIONS: {msg}'}))
+        if not has_uploaded_cookies:
+            if has_manual_cookiefile:
+                return web.Response(
+                    status=400,
+                    text=serializer.encode({
+                        'status': 'error',
+                        'msg': 'Cookies are configured manually via YTDL_OPTIONS (cookiefile). Remove or change that setting manually; UI delete only removes uploaded cookies.'
+                    })
+                )
+            return web.Response(status=400, text=serializer.encode({'status': 'error', 'msg': 'No uploaded cookies to delete'}))
 
-    log.info('Cookies file deleted')
+        os.remove(cookie_path)
+        config.remove_runtime_override('cookiefile')
+        success, msg = config.load_ytdl_options()
+        if not success:
+            log.error(f'Cookies file deleted, but failed to reload YTDL_OPTIONS: {msg}')
+            return web.Response(status=500, text=serializer.encode({'status': 'error', 'msg': f'Cookies file deleted, but failed to reload YTDL_OPTIONS: {msg}'}))
+    else:
+        if not has_uploaded_cookies:
+            return web.Response(status=400, text=serializer.encode({'status': 'error', 'msg': 'No uploaded cookies to delete'}))
+        os.remove(cookie_path)
+
+    log.info(f'Cookies file deleted for {user.username if user else "global"}')
     return web.Response(text=serializer.encode({'status': 'ok'}))
 
 @routes.get(config.URL_PREFIX + 'cookie-status')
 async def cookie_status(request):
-    configured_cookiefile = config.YTDL_OPTIONS.get('cookiefile')
-    has_configured_cookies = isinstance(configured_cookiefile, str) and os.path.exists(configured_cookiefile)
-    has_uploaded_cookies = os.path.exists(COOKIES_PATH)
-    exists = has_uploaded_cookies or has_configured_cookies
+    user = get_authenticated_user(request)
+    cookie_path = get_user_cookies_path(user)
+    if not (config.AUTH_ENABLED and user):
+        configured_cookiefile = config.YTDL_OPTIONS.get('cookiefile')
+        has_configured_cookies = isinstance(configured_cookiefile, str) and os.path.exists(configured_cookiefile)
+        has_uploaded_cookies = os.path.exists(cookie_path)
+        exists = has_uploaded_cookies or has_configured_cookies
+    else:
+        exists = os.path.exists(cookie_path)
     return web.Response(text=serializer.encode({'status': 'ok', 'has_cookies': exists}))
 
 @routes.get(config.URL_PREFIX + 'history')
 async def history(request):
+    user = get_authenticated_user(request)
+    for_user = user.username if (config.AUTH_ENABLED and user) else None
     history = { 'done': [], 'queue': [], 'pending': []}
 
     # Served from the in-memory queues (like the socket 'all' event) rather
     # than saved_items(), which reloads and re-compacts the on-disk state on
     # every call.
     for _, v in dqueue.queue.items():
-        history['queue'].append(v.info)
+        if for_user is None or getattr(v.info, 'user', '') == for_user:
+            history['queue'].append(v.info)
     for _, v in dqueue.done.items():
-        history['done'].append(v.info)
+        if for_user is None or getattr(v.info, 'user', '') == for_user:
+            history['done'].append(v.info)
     for _, v in dqueue.pending.items():
-        history['pending'].append(v.info)
+        if for_user is None or getattr(v.info, 'user', '') == for_user:
+            history['pending'].append(v.info)
 
     log.info("Sending download history")
     return web.Response(text=serializer.encode(history))
 
-async def _emit_connect_finish(sid):
+async def _emit_connect_finish(sid, for_user=None):
     """Slow connect-finish events, dispatched off the connect-ACK path.
 
     The socket.io connect ACK is sent only after the ``connect`` handler
@@ -1415,15 +1617,37 @@ async def _emit_connect_finish(sid):
     """
     loop = asyncio.get_running_loop()
     if config.CUSTOM_DIRS:
-        dirs = await loop.run_in_executor(None, get_custom_dirs)
+        if config.AUTH_ENABLED and for_user:
+            dirs = await loop.run_in_executor(None, get_custom_dirs, for_user)
+        else:
+            dirs = await loop.run_in_executor(None, get_custom_dirs)
         await sio.emit('custom_dirs', serializer.encode(dirs), to=sid)
     if config.YTDL_OPTIONS_FILE:
         options_update = await loop.run_in_executor(None, get_options_update_time)
         await sio.emit('ytdl_options_changed', serializer.encode(options_update), to=sid)
 
 @sio.event
-async def connect(sid, environ):
-    log.info(f"Client connected: {sid}")
+async def connect(sid, environ, auth=None):
+    user = None
+    if config.AUTH_ENABLED:
+        token = None
+        if isinstance(auth, dict) and auth.get('token'):
+            token = auth['token']
+        if not token:
+            token = _get_cookie_from_environ(environ, 'metube_session')
+        if token:
+            user = session_mgr.get_user(token, user_mgr)
+        if not user:
+            log.warning(f"Socket.IO connection rejected for {sid}: unauthenticated")
+            return False
+
+        await sio.enter_room(sid, f"user:{user.username}")
+        if user.role == 'admin':
+            await sio.enter_room(sid, "admin")
+
+    log.info(f"Client connected: {sid} (user={user.username if user else 'anonymous'})")
+    for_user = user.username if (config.AUTH_ENABLED and user) else None
+
     # Gather + serialize on the event loop: ``dqueue.get()`` iterates the queue
     # dicts and the encoder reads ``DownloadInfo`` objects the progress hooks
     # are updating, so a worker thread risks ``RuntimeError: dictionary changed
@@ -1432,8 +1656,8 @@ async def connect(sid, environ):
     # handshake -- ``_save_dict_async`` serializes on the loop for the same
     # reason. 'all' goes out first: the UI populates its state from it before
     # the finer-grained events that may follow.
-    await sio.emit('all', serializer.encode(dqueue.get()), to=sid)
-    await sio.emit('subscriptions_all', serializer.encode([s.to_public_dict() for s in submgr.list_all()]), to=sid)
+    await sio.emit('all', serializer.encode(dqueue.get(for_user=for_user)), to=sid)
+    await sio.emit('subscriptions_all', serializer.encode([s.to_public_dict() for s in submgr.list_all(for_user=for_user)]), to=sid)
     await sio.emit('formats', serializer.encode(format_catalog.public_catalog()), to=sid)
     await sio.emit('configuration', serializer.encode(config.frontend_safe()), to=sid)
     # The slow directory / ytdl-options emits must NOT be awaited here: the
@@ -1441,11 +1665,11 @@ async def connect(sid, environ):
     # would delay the handshake past the engine.io ping window. Dispatch them
     # as a background task (strong-referenced, failures logged) so the ACK
     # goes out immediately.
-    bg_tasks.create_task(_emit_connect_finish(sid), name=f"connect_finish_{sid}")
+    bg_tasks.create_task(_emit_connect_finish(sid, for_user=for_user), name=f"connect_finish_{sid}")
 
 _CUSTOM_DIRS_CACHE_TTL_SECONDS = 5
-# (key, time, value) of the last listing; a connect storm reuses it.
-_custom_dirs_cache = None
+# (key, time, value) of listings; a connect storm reuses it.
+_custom_dirs_cache = {}
 
 
 def _list_subdirs(base: str) -> list[str]:
@@ -1460,6 +1684,8 @@ def _list_subdirs(base: str) -> list[str]:
     root = pathlib.Path(base)
     exclude = config.CUSTOM_DIRS_EXCLUDE_RE
     dirs = ['']
+    if not root.exists():
+        return dirs
     for path in root.glob('**/'):
         rel = path.relative_to(root).as_posix()
         if rel == '.' or (exclude is not None and exclude.search(rel)):
@@ -1468,27 +1694,27 @@ def _list_subdirs(base: str) -> list[str]:
     return dirs
 
 
-def get_custom_dirs():
+def get_custom_dirs(for_user=None):
     global _custom_dirs_cache
     now = time.monotonic()
-    key = (config.DOWNLOAD_DIR, config.AUDIO_DOWNLOAD_DIR, config.CUSTOM_DIRS_EXCLUDE_REGEX)
-    if (
-        _custom_dirs_cache is not None
-        and _custom_dirs_cache[0] == key
-        and now - _custom_dirs_cache[1] < _CUSTOM_DIRS_CACHE_TTL_SECONDS
-    ):
-        return _custom_dirs_cache[2]
+    key = (config.DOWNLOAD_DIR, config.AUDIO_DOWNLOAD_DIR, config.CUSTOM_DIRS_EXCLUDE_REGEX, for_user)
+    cached = _custom_dirs_cache.get(key)
+    if cached is not None and now - cached[0] < _CUSTOM_DIRS_CACHE_TTL_SECONDS:
+        return cached[1]
 
-    download_dir = _list_subdirs(config.DOWNLOAD_DIR)
+    base_dl = os.path.join(config.DOWNLOAD_DIR, for_user) if (config.AUTH_ENABLED and for_user) else config.DOWNLOAD_DIR
+    base_adl = os.path.join(config.AUDIO_DOWNLOAD_DIR, for_user) if (config.AUTH_ENABLED and for_user) else config.AUDIO_DOWNLOAD_DIR
+
+    download_dir = _list_subdirs(base_dl)
     audio_download_dir = download_dir
-    if config.DOWNLOAD_DIR != config.AUDIO_DOWNLOAD_DIR:
-        audio_download_dir = _list_subdirs(config.AUDIO_DOWNLOAD_DIR)
+    if base_dl != base_adl:
+        audio_download_dir = _list_subdirs(base_adl)
 
     result = {
         "download_dir": download_dir,
         "audio_download_dir": audio_download_dir
     }
-    _custom_dirs_cache = (key, now, result)
+    _custom_dirs_cache[key] = (now, result)
     return result
 
 @routes.get(config.URL_PREFIX)
@@ -1524,8 +1750,236 @@ if config.URL_PREFIX != '/':
     async def index_redirect_dir(request):
         return web.HTTPFound(config.URL_PREFIX)
 
-routes.static(config.URL_PREFIX + 'download/', config.DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
-routes.static(config.URL_PREFIX + 'audio_download/', config.AUDIO_DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
+# Auth endpoints
+@routes.get(config.URL_PREFIX + 'api/auth/status')
+async def auth_status(request):
+    user = get_authenticated_user(request)
+    return web.json_response({
+        'status': 'ok',
+        'auth_enabled': config.AUTH_ENABLED,
+        'setup_required': config.AUTH_ENABLED and not user_mgr.has_users(),
+        'logged_in': user is not None,
+        'user': user.to_dict() if user else None,
+    })
+
+
+@routes.post(config.URL_PREFIX + 'api/auth/setup')
+async def auth_setup(request):
+    if not config.AUTH_ENABLED:
+        raise web.HTTPBadRequest(reason='Authentication is disabled')
+    if user_mgr.has_users():
+        raise web.HTTPForbidden(reason='Setup is already completed')
+    post = await _read_json_request(request)
+    username = str(post.get('username') or '').strip()
+    password = str(post.get('password') or '')
+    if not username or not password:
+        raise web.HTTPBadRequest(reason='Username and password are required')
+    valid, err = validate_username(username)
+    if not valid:
+        raise web.HTTPBadRequest(reason=err)
+    if len(password) < 6:
+        raise web.HTTPBadRequest(reason='Password must be at least 6 characters long')
+
+    user = user_mgr.create_user(username, password, role='admin')
+    token = session_mgr.create_session(user.id)
+    response = web.json_response({
+        'status': 'ok',
+        'token': token,
+        'user': user.to_dict(),
+    })
+    _set_auth_cookie(response, token)
+    return response
+
+
+@routes.post(config.URL_PREFIX + 'api/auth/login')
+async def auth_login(request):
+    if not config.AUTH_ENABLED:
+        return web.json_response({'status': 'ok', 'msg': 'Auth disabled'})
+    post = await _read_json_request(request)
+    username = str(post.get('username') or '').strip()
+    password = str(post.get('password') or '')
+    user = user_mgr.authenticate(username, password)
+    if not user:
+        raise web.HTTPUnauthorized(
+            text=serializer.encode({'status': 'error', 'msg': 'Invalid username or password'}),
+            content_type='application/json',
+        )
+    token = session_mgr.create_session(user.id)
+    response = web.json_response({
+        'status': 'ok',
+        'token': token,
+        'user': user.to_dict(),
+    })
+    _set_auth_cookie(response, token)
+    return response
+
+
+@routes.post(config.URL_PREFIX + 'api/auth/logout')
+async def auth_logout(request):
+    cookie_token = request.cookies.get('metube_session')
+    if cookie_token:
+        session_mgr.delete_session(cookie_token)
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Bearer '):
+        session_mgr.delete_session(auth_header[7:].strip())
+    response = web.json_response({'status': 'ok'})
+    _clear_auth_cookie(response)
+    return response
+
+
+@routes.get(config.URL_PREFIX + 'api/auth/me')
+async def auth_me(request):
+    user = require_user(request)
+    return web.json_response({
+        'status': 'ok',
+        'user': user.to_dict(),
+    })
+
+
+@routes.post(config.URL_PREFIX + 'api/auth/change-password')
+async def auth_change_password(request):
+    user = require_user(request)
+    post = await _read_json_request(request)
+    current_password = str(post.get('current_password') or '')
+    new_password = str(post.get('new_password') or '')
+    if not current_password or not new_password:
+        raise web.HTTPBadRequest(reason='Current and new password required')
+    if not user_mgr.authenticate(user.username, current_password):
+        raise web.HTTPBadRequest(reason='Current password is incorrect')
+    if len(new_password) < 6:
+        raise web.HTTPBadRequest(reason='New password must be at least 6 characters long')
+    user_mgr.change_password(user.id, new_password)
+    return web.json_response({'status': 'ok'})
+
+
+# User management endpoints (admin only)
+@routes.get(config.URL_PREFIX + 'api/users')
+async def list_users_route(request):
+    require_admin(request)
+    users = user_mgr.list_users()
+    return web.json_response({
+        'status': 'ok',
+        'users': [u.to_dict() for u in users],
+    })
+
+
+@routes.post(config.URL_PREFIX + 'api/users')
+async def create_user_route(request):
+    require_admin(request)
+    post = await _read_json_request(request)
+    username = str(post.get('username') or '').strip()
+    password = str(post.get('password') or '')
+    role = str(post.get('role') or 'user').strip()
+    if role not in ('admin', 'user'):
+        raise web.HTTPBadRequest(reason='Role must be "admin" or "user"')
+    valid, err = validate_username(username)
+    if not valid:
+        raise web.HTTPBadRequest(reason=err)
+    if len(password) < 6:
+        raise web.HTTPBadRequest(reason='Password must be at least 6 characters long')
+    try:
+        user = user_mgr.create_user(username, password, role=role)
+    except ValueError as e:
+        raise web.HTTPBadRequest(reason=str(e))
+    return web.json_response({
+        'status': 'ok',
+        'user': user.to_dict(),
+    })
+
+
+@routes.put(config.URL_PREFIX + r'api/users/{user_id}')
+async def update_user_route(request):
+    admin = require_admin(request)
+    user_id = request.match_info['user_id']
+    target_user = user_mgr.get_user_by_id(user_id)
+    if not target_user:
+        raise web.HTTPNotFound(reason='User not found')
+    post = await _read_json_request(request)
+    role = post.get('role')
+    password = post.get('password')
+    if role is not None:
+        role = str(role).strip()
+        if role not in ('admin', 'user'):
+            raise web.HTTPBadRequest(reason='Role must be "admin" or "user"')
+        try:
+            target_user = user_mgr.update_user_role(user_id, role)
+        except ValueError as e:
+            raise web.HTTPBadRequest(reason=str(e))
+    if password is not None and str(password):
+        password = str(password)
+        if len(password) < 6:
+            raise web.HTTPBadRequest(reason='Password must be at least 6 characters long')
+        user_mgr.change_password(user_id, password)
+    return web.json_response({
+        'status': 'ok',
+        'user': target_user.to_dict(),
+    })
+
+
+@routes.delete(config.URL_PREFIX + r'api/users/{user_id}')
+async def delete_user_route(request):
+    admin = require_admin(request)
+    user_id = request.match_info['user_id']
+    if user_id == admin.id:
+        raise web.HTTPBadRequest(reason='Cannot delete your own account')
+    target_user = user_mgr.get_user_by_id(user_id)
+    if not target_user:
+        raise web.HTTPNotFound(reason='User not found')
+    try:
+        user_mgr.delete_user(user_id)
+    except ValueError as e:
+        raise web.HTTPBadRequest(reason=str(e))
+    session_mgr.delete_sessions_for_user(user_id)
+    return web.json_response({'status': 'ok'})
+
+
+async def _serve_download_file(request: web.Request, base_dir: str):
+    rel_path = request.match_info.get('tail', '').lstrip('/')
+    user = get_authenticated_user(request)
+    if config.AUTH_ENABLED:
+        if not user:
+            raise web.HTTPUnauthorized(
+                text=serializer.encode({'status': 'error', 'msg': 'Authentication required'}),
+                content_type='application/json',
+            )
+        root_dir = os.path.join(base_dir, user.username)
+    else:
+        root_dir = base_dir
+
+    real_root = os.path.realpath(root_dir)
+    target_path = os.path.realpath(os.path.join(root_dir, rel_path)) if rel_path else real_root
+
+    # Path traversal protection
+    if not (target_path == real_root or target_path.startswith(real_root + os.sep)):
+        raise web.HTTPForbidden(reason="Access denied")
+
+    if not os.path.exists(target_path):
+        raise web.HTTPNotFound()
+
+    if os.path.isdir(target_path):
+        if not config.DOWNLOAD_DIRS_INDEXABLE:
+            raise web.HTTPForbidden(reason="Directory listing forbidden")
+        entries = sorted(os.listdir(target_path))
+        lines = [f'<html><head><title>Index of /{html.escape(rel_path)}</title></head><body><h1>Index of /{html.escape(rel_path)}</h1><ul>']
+        for entry in entries:
+            href = urllib.parse.quote(entry)
+            lines.append(f'<li><a href="{href}">{html.escape(entry)}</a></li>')
+        lines.append('</ul></body></html>')
+        return web.Response(text=''.join(lines), content_type='text/html')
+
+    return web.FileResponse(target_path)
+
+
+@routes.get(config.URL_PREFIX + r'download/{tail:.*}')
+async def serve_download(request):
+    return await _serve_download_file(request, config.DOWNLOAD_DIR)
+
+
+@routes.get(config.URL_PREFIX + r'audio_download/{tail:.*}')
+async def serve_audio_download(request):
+    return await _serve_download_file(request, config.AUDIO_DOWNLOAD_DIR)
+
+
 routes.static(config.URL_PREFIX, os.path.join(config.BASE_DIR, 'ui/dist/metube/browser'))
 try:
     app.add_routes(routes)
@@ -1538,6 +1992,10 @@ except ValueError as e:
 # @routes.options(config.URL_PREFIX + 'add')
 async def add_cors(request):
     return web.Response(text=serializer.encode({"status": "ok"}))
+
+app.router.add_route('OPTIONS', config.URL_PREFIX + r'api/{tail:.*}', add_cors)
+app.router.add_route('OPTIONS', config.URL_PREFIX + r'download/{tail:.*}', add_cors)
+app.router.add_route('OPTIONS', config.URL_PREFIX + r'audio_download/{tail:.*}', add_cors)
 
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'add', add_cors)
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'browse', add_cors)

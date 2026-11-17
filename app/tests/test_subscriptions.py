@@ -77,7 +77,7 @@ class _Notifier:
     async def subscription_updated(self, sub):
         return None
 
-    async def subscription_removed(self, sub_id):
+    async def subscription_removed(self, sub_id, user=""):
         return None
 
     async def subscriptions_all(self, subs):

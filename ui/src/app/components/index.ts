@@ -6,3 +6,6 @@ export { SubscriptionsSectionComponent } from './subscriptions-section.component
 export { BatchImportComponent } from './batch-import.component';
 export { DownloadingSectionComponent } from './downloading-section.component';
 export { CompletedSectionComponent } from './completed-section.component';
+export { LoginComponent } from './login.component';
+export { ChangePasswordModalComponent } from './change-password-modal.component';
+export { UserManagementModalComponent } from './user-management-modal.component';

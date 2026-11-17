@@ -355,6 +355,7 @@ class SubscriptionInfo:
     last_checked: Optional[float] = None
     seen_ids: list[str] = field(default_factory=list)
     error: Optional[str] = None
+    user: str = ""
     timestamp: float = field(default_factory=time.time)
 
     def seen_set(self) -> set[str]:
@@ -381,6 +382,7 @@ class SubscriptionInfo:
             clip_end=self.clip_end,
             sponsorblock=self.sponsorblock,
             audio_tags=self.audio_tags,
+            user=self.user,
         )
 
     def to_public_dict(self) -> dict:
@@ -402,6 +404,7 @@ class SubscriptionInfo:
             "last_checked": self.last_checked,
             "seen_count": len(self.seen_ids),
             "error": self.error,
+            "user": self.user,
         }
 
 
@@ -435,6 +438,7 @@ def _subscription_to_record(sub: SubscriptionInfo) -> dict[str, Any]:
         "last_checked": sub.last_checked,
         "seen_ids": list(sub.seen_ids),
         "error": sub.error,
+        "user": sub.user,
     }
 
 
@@ -554,7 +558,7 @@ class SubscriptionNotifier:
     async def subscription_updated(self, sub: SubscriptionInfo) -> None:
         raise NotImplementedError
 
-    async def subscription_removed(self, sub_id: str) -> None:
+    async def subscription_removed(self, sub_id: str, user: str = "") -> None:
         raise NotImplementedError
 
     async def subscriptions_all(self, subs: list[SubscriptionInfo]) -> None:
@@ -695,7 +699,9 @@ class SubscriptionManager:
             queued_ids.append(eid)
         return queued_ids, queue_errors
 
-    def list_all(self) -> list[SubscriptionInfo]:
+    def list_all(self, for_user=None) -> list[SubscriptionInfo]:
+        if for_user is not None:
+            return [s for s in self._subs.values() if s.user == for_user]
         return list(self._subs.values())
 
     def get(self, sub_id: str) -> Optional[SubscriptionInfo]:
@@ -779,6 +785,7 @@ class SubscriptionManager:
         skip_subscriber_only: Any = None,
         clip_start: Optional[float] = None,
         clip_end: Optional[float] = None,
+        user: str = "",
     ) -> dict:
         url = self._normalize_url(url)
         if not url:
@@ -883,6 +890,7 @@ class SubscriptionManager:
                 last_checked=time.time(),
                 seen_ids=list(dict.fromkeys(all_ids)),
                 error=None,
+                user=user,
             )
 
             async with self._lock:
@@ -903,17 +911,20 @@ class SubscriptionManager:
             async with self._lock:
                 self._pending_urls.discard(url)
 
-    async def delete_subscriptions(self, ids: list[str]) -> dict:
+    async def delete_subscriptions(self, ids: list[str], for_user=None) -> dict:
         removed: list[str] = []
         async with self._lock:
             previous_subs = self._subs.copy()
             previous_index = self._url_index.copy()
             for sid in ids:
-                sub = self._subs.pop(sid, None)
+                sub = self._subs.get(sid)
                 if sub:
+                    if for_user is not None and sub.user and sub.user != for_user:
+                        continue
+                    self._subs.pop(sid, None)
                     normalized_url = self._normalize_url(sub.url)
                     self._url_index.pop(normalized_url, None)
-                    removed.append(sid)
+                    removed.append((sid, sub.user or ""))
             if removed:
                 try:
                     self._save_locked()
@@ -921,11 +932,15 @@ class SubscriptionManager:
                     self._subs = previous_subs
                     self._url_index = previous_index
                     raise
-        for sid in removed:
-            await self.notifier.subscription_removed(sid)
+        for sid, user in removed:
+            await self.notifier.subscription_removed(sid, user=user)
         return {"status": "ok"}
 
-    async def update_subscription(self, sub_id: str, changes: dict) -> dict:
+    async def update_subscription(self, sub_id: str, changes: dict, for_user=None) -> dict:
+        if for_user is not None:
+            sub = self._subs.get(sub_id)
+            if not sub or (sub.user and sub.user != for_user):
+                return {"status": "error", "msg": "Permission denied"}
         validated_name: Optional[str] = None
         if "name" in changes:
             try:
@@ -1009,13 +1024,15 @@ class SubscriptionManager:
         await self.notifier.subscription_updated(updated)
         return {"status": "ok", "subscription": updated.to_public_dict()}
 
-    async def check_now(self, ids: Optional[list[str]] = None) -> dict:
+    async def check_now(self, ids: Optional[list[str]] = None, for_user=None) -> dict:
         async with self._lock:
             targets = (
                 [self._subs[i] for i in ids if i in self._subs]
                 if ids
                 else [s for s in self._subs.values() if s.enabled]
             )
+            if for_user is not None:
+                targets = [s for s in targets if not s.user or s.user == for_user]
         log.info(
             "Manual subscription check requested for %d subscription(s)",
             len(targets),

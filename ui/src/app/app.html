@@ -48,7 +48,7 @@
       </ul>
     </div>
     -->
-    <div class="navbar-nav ms-auto">
+    <div class="navbar-nav ms-auto d-flex flex-row align-items-center">
       <div class="nav-item dropdown" ngbDropdown placement="bottom-end">
         <button class="btn btn-link nav-link py-2 px-0 px-sm-2 dropdown-toggle d-flex align-items-center"
           id="theme-select"
@@ -79,11 +79,75 @@
           }
         </ul>
       </div>
+
+      @if (authService.authEnabled() && authService.isAuthenticated()) {
+        <div class="nav-item dropdown ms-3" ngbDropdown placement="bottom-end">
+          <button class="btn btn-link nav-link py-1 px-2 dropdown-toggle d-flex align-items-center"
+            id="user-menu"
+            type="button"
+            aria-expanded="false"
+            ngbDropdownToggle>
+            <fa-icon [icon]="authService.isAdmin() ? faUserShield : faUser" class="me-1" />
+            <span class="d-none d-sm-inline">{{ authService.currentUser()?.username }}</span>
+          </button>
+          <ul class="dropdown-menu dropdown-menu-end position-absolute" aria-labelledby="user-menu" ngbDropdownMenu>
+            <li class="dropdown-header">
+              Signed in as <strong>{{ authService.currentUser()?.username }}</strong>
+              @if (authService.isAdmin()) {
+                <span class="badge bg-primary ms-1">admin</span>
+              }
+            </li>
+            <li><hr class="dropdown-divider"></li>
+            @if (authService.isAdmin()) {
+              <li>
+                <button type="button" class="dropdown-item d-flex align-items-center"
+                  ngbDropdownItem
+                  (click)="openUserManagement()">
+                  <span class="me-2 opacity-50">
+                    <fa-icon [icon]="faUsers" />
+                  </span>
+                  Manage Users
+                </button>
+              </li>
+            }
+            <li>
+              <button type="button" class="dropdown-item d-flex align-items-center"
+                ngbDropdownItem
+                (click)="openChangePassword()">
+                <span class="me-2 opacity-50">
+                  <fa-icon [icon]="faKey" />
+                </span>
+                Change Password
+              </button>
+            </li>
+            <li><hr class="dropdown-divider"></li>
+            <li>
+              <button type="button" class="dropdown-item d-flex align-items-center text-danger"
+                ngbDropdownItem
+                (click)="logout()">
+                <span class="me-2 opacity-50">
+                  <fa-icon [icon]="faSignOutAlt" />
+                </span>
+                Log Out
+              </button>
+            </li>
+          </ul>
+        </div>
+      }
     </div>
   </div>
 </nav>
 
-<main role="main" class="container container-xl">
+@if (!authService.checked()) {
+  <div class="d-flex justify-content-center align-items-center py-5">
+    <div class="spinner-border text-primary" role="status">
+      <span class="visually-hidden">Loading...</span>
+    </div>
+  </div>
+} @else if (authService.authEnabled() && !authService.isAuthenticated()) {
+  <app-login (loginSuccess)="onLoginSuccess()" />
+} @else {
+  <main role="main" class="container container-xl">
   <form #f="ngForm">
     <div class="container add-url-box">
       <!-- Main URL Input with Download Button -->
@@ -616,6 +680,7 @@
 
   <app-subscriptions-section />
 </main><!-- /.container -->
+}
 
 <footer class="footer navbar-dark bg-dark py-3 mt-5">
   <div class="container text-center">

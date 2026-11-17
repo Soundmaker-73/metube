@@ -8,6 +8,7 @@ import { AddDownloadPayload, DownloadsService } from './services/downloads.servi
 import { SubscriptionsService } from './services/subscriptions.service';
 import { ToastService } from './services/toast.service';
 import { SettingsStore } from './services/settings-store.service';
+import { AuthService } from './services/auth.service';
 import { CookieService } from 'ngx-cookie-service';
 import { Download, FormatCatalog } from './interfaces';
 import { catalogTypes, formatLabel } from './catalog-labels';
@@ -216,7 +217,19 @@ describe('App', () => {
         {
           provide: HttpClient,
           useValue: {
-            get: vi.fn().mockReturnValue(of({ 'yt-dlp': 'test', version: 'test' })),
+            get: vi.fn().mockImplementation((url: string) => {
+              if (url === 'api/auth/status') {
+                return of({
+                  status: 'ok',
+                  auth_enabled: false,
+                  setup_required: false,
+                  logged_in: false,
+                  user: null,
+                });
+              }
+              return of({ 'yt-dlp': 'test', version: 'test' });
+            }),
+            post: vi.fn().mockReturnValue(of({ status: 'ok' })),
           },
         },
       ],
@@ -1448,6 +1461,43 @@ describe('App', () => {
       expect(chooseSpy.mock.calls[0][0]).toContain('2 items');
       expect(delSpy).toHaveBeenCalledTimes(1);
       expect(delSpy).toHaveBeenCalledWith('done', ['u1', 'u2'], true);
+    });
+  });
+
+  describe('Auth', () => {
+    it('opens UserManagementModalComponent on openUserManagement', () => {
+      const fixture = TestBed.createComponent(App);
+      const app = fixture.componentInstance;
+      const modal = app['modal'] as NgbModal;
+      const openSpy = vi.spyOn(modal, 'open').mockReturnValue({} as NgbModalRef);
+
+      app.openUserManagement();
+      expect(openSpy).toHaveBeenCalled();
+    });
+
+    it('opens ChangePasswordModalComponent on openChangePassword', () => {
+      const fixture = TestBed.createComponent(App);
+      const app = fixture.componentInstance;
+      const modal = app['modal'] as NgbModal;
+      const openSpy = vi.spyOn(modal, 'open').mockReturnValue({} as NgbModalRef);
+
+      app.openChangePassword();
+      expect(openSpy).toHaveBeenCalled();
+    });
+
+    it('logout clears downloads and subscriptions', () => {
+      const fixture = TestBed.createComponent(App);
+      const app = fixture.componentInstance;
+      const authService = TestBed.inject(AuthService);
+      vi.spyOn(authService, 'logout').mockReturnValue(of({ status: 'ok' }));
+
+      downloads.queue.set('u1', {} as Download);
+      downloads.done.set('u2', {} as Download);
+
+      app.logout();
+
+      expect(downloads.queue.size).toBe(0);
+      expect(downloads.done.size).toBe(0);
     });
   });
 

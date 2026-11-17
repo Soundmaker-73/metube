@@ -7,7 +7,7 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { FontAwesomeModule } from '@fortawesome/angular-fontawesome';
 import { NgbModal, NgbModule, NgbTypeahead } from '@ng-bootstrap/ng-bootstrap';
 import { NgSelectModule } from '@ng-select/ng-select';
-import { faTrashAlt, faCheckCircle, faTimesCircle, faCheck, faDownload, faFileImport, faFileExport, faCopy, faClock, faTachometerAlt, faChevronRight, faChevronDown, faUpload } from '@fortawesome/free-solid-svg-icons';
+import { faTrashAlt, faCheckCircle, faTimesCircle, faCheck, faDownload, faFileImport, faFileExport, faCopy, faClock, faTachometerAlt, faChevronRight, faChevronDown, faUpload, faUser, faUsers, faKey, faSignOutAlt, faUserShield } from '@fortawesome/free-solid-svg-icons';
 import { faGithub } from '@fortawesome/free-brands-svg-icons';
 import { CookieService } from 'ngx-cookie-service';
 import { ADD_REQUEST_CONCURRENCY, AddDownloadPayload, DownloadsService } from './services/downloads.service';
@@ -16,6 +16,7 @@ import { SubscriptionsService } from './services/subscriptions.service';
 import { ToastService } from './services/toast.service';
 import { BatchUrlsService, BatchUrlFilter } from './services/batch-urls.service';
 import { SettingsStore } from './services/settings-store.service';
+import { AuthService } from './services/auth.service';
 import { Themes } from './theme';
 import {
   Status,
@@ -34,6 +35,9 @@ import {
   BatchImportComponent,
   DownloadingSectionComponent,
   CompletedSectionComponent,
+  LoginComponent,
+  ChangePasswordModalComponent,
+  UserManagementModalComponent,
 } from './components/';
 
 @Component({
@@ -50,11 +54,13 @@ import {
         SubscriptionsSectionComponent,
         DownloadingSectionComponent,
         CompletedSectionComponent,
+        LoginComponent,
   ],
   templateUrl: './app.html',
   styleUrl: './app.sass',
 })
 export class App implements AfterViewInit, OnInit, OnDestroy {
+  authService = inject(AuthService);
   downloads = inject(DownloadsService);
   subscriptionsSvc = inject(SubscriptionsService);
   private toasts = inject(ToastService);
@@ -160,6 +166,11 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   faChevronRight = faChevronRight;
   faChevronDown = faChevronDown;
   faUpload = faUpload;
+  faUser = faUser;
+  faUsers = faUsers;
+  faKey = faKey;
+  faSignOutAlt = faSignOutAlt;
+  faUserShield = faUserShield;
   constructor() {
     // The page opens ready for a pasted URL. This waits for the first render
     // to finish: moving focus inside change detection confuses its bookkeeping.
@@ -213,6 +224,9 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   }
 
   ngOnInit() {
+    this.authService.checkStatus().pipe(takeUntilDestroyed(this.destroyRef)).subscribe(() => {
+      this.cdr.markForCheck();
+    });
     this.downloads.getCookieStatus().pipe(takeUntilDestroyed(this.destroyRef)).subscribe(data => {
       this.hasCookies = !!(data && typeof data === 'object' && 'has_cookies' in data && data.has_cookies);
       this.cdr.markForCheck();
@@ -223,6 +237,49 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     this.setTheme(this.activeTheme!);
 
     this.colorSchemeMediaQuery.addEventListener('change', this.onColorSchemeChanged);
+  }
+
+  onLoginSuccess() {
+    this.socket.disconnect();
+    this.socket.connect();
+    this.downloads.getCookieStatus().pipe(takeUntilDestroyed(this.destroyRef)).subscribe(data => {
+      this.hasCookies = !!(data && typeof data === 'object' && 'has_cookies' in data && data.has_cookies);
+      this.cdr.markForCheck();
+    });
+    this.getConfiguration();
+    this.getYtdlOptionsUpdateTime();
+    this.getYtdlOptionPresets();
+    setTimeout(() => this.focusUrlInput(), 50);
+    this.cdr.markForCheck();
+  }
+
+  logout() {
+    this.authService.logout().subscribe({
+      next: () => {
+        this.socket.disconnect();
+        this.socket.connect();
+        this.downloads.queue.clear();
+        this.downloads.done.clear();
+        this.downloads.queueChanged.next();
+        this.downloads.doneChanged.next();
+        this.subscriptionsSvc.subscriptions.clear();
+        this.subscriptionsSvc.subscriptionsChanged.next();
+        this.cdr.markForCheck();
+      },
+      error: () => {
+        this.socket.disconnect();
+        this.socket.connect();
+        this.cdr.markForCheck();
+      },
+    });
+  }
+
+  openUserManagement() {
+    this.modal.open(UserManagementModalComponent, { size: 'lg' });
+  }
+
+  openChangePassword() {
+    this.modal.open(ChangePasswordModalComponent);
   }
 
   ngAfterViewInit() {

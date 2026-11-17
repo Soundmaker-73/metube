@@ -50,6 +50,14 @@ MeTube is configured with environment variables: `-e NAME=value` on the `docker 
 | `ENABLE_ACCESSLOG` | `false` | Log every HTTP request. |
 | `DEFAULT_THEME` | `auto` | UI theme: `light`, `dark`, or `auto` to follow the system. |
 
+### Authentication and users
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `AUTH_ENABLED` | `true` | Enable multi-user authentication with isolated user spaces and private download directories. Set to `false` for open single-user mode. |
+| `ADMIN_USER` | | Initial admin username to bootstrap on startup when auth is enabled. |
+| `ADMIN_PASSWORD` | | Initial admin password to bootstrap on startup when auth is enabled. |
+
 ### Downloads
 
 | Variable | Default | Description |

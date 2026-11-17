@@ -26,6 +26,7 @@ def _ensure_test_env() -> None:
     os.environ["YTDL_OPTIONS_FILE"] = ""
     os.environ["BASE_DIR"] = str(base)
     os.environ["LOGLEVEL"] = "INFO"
+    os.environ.setdefault("AUTH_ENABLED", "false")
     os.environ["METUBE_TEST_ENV_READY"] = "1"
 
 
