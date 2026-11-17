@@ -12,6 +12,8 @@ services:
       - PUID=1000
       - PGID=1000
       - AUTH_ENABLED=true
+      # Also delete files from storage when removed from Completed ('true', 'false', or 'ask')
+      - DELETE_FILE_ON_TRASHCAN=true
       # Default admin account created on first startup (if not already created)
       - ADMIN_USER=admin
       - ADMIN_PASSWORD=admin

@@ -25,6 +25,7 @@ MeTube includes full multi-user support with:
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `AUTH_ENABLED` | `true` | Enables multi-user authentication. Set to `false` for open single-user mode. |
+| `DELETE_FILE_ON_TRASHCAN` | `false` | When an item is removed from Completed: `false` (keep file on disk, default), `true` (delete file from storage), `ask` (prompt user each time). |
 | `ADMIN_USER` | *(empty)* | Optional initial admin username for unattended setup on first startup. |
 | `ADMIN_PASSWORD` | *(empty)* | Optional initial admin password for unattended setup on first startup. |
 

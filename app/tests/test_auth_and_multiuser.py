@@ -440,3 +440,76 @@ def test_custom_dirs_user_isolation(auth_env):
 
     assert "music" in bob_dirs["download_dir"]
     assert "movies" not in bob_dirs["download_dir"]
+
+
+@pytest.mark.asyncio
+async def test_clear_completed_deletes_user_file_when_enabled(auth_env):
+    from ytdl import DownloadQueue, DownloadInfo
+    dl_dir = auth_env["dl_dir"]
+    main.config.DELETE_FILE_ON_TRASHCAN = "true"
+
+    dq = DownloadQueue(main.config, AsyncMock())
+    alice_dir = os.path.join(dl_dir, "alice")
+    os.makedirs(alice_dir, exist_ok=True)
+    video_path = os.path.join(alice_dir, "video.mp4")
+    with open(video_path, "w") as f:
+        f.write("dummy")
+
+    from ytdl import _download_info_from_record
+    info = _download_info_from_record({
+        "id": "https://example.com/v1",
+        "url": "https://example.com/v1",
+        "title": "Test Video",
+        "quality": "best",
+        "download_type": "video",
+        "codec": "auto",
+        "format": "any",
+        "folder": "",
+        "status": "finished",
+        "filename": "video.mp4",
+        "user": "alice",
+    })
+    fake_dl = MagicMock()
+    fake_dl.info = info
+    await dq.done.put(fake_dl)
+
+    assert os.path.exists(video_path) is True
+    await dq.clear(["https://example.com/v1"], for_user="alice")
+    assert os.path.exists(video_path) is False
+    assert not dq.done.exists("https://example.com/v1")
+
+
+@pytest.mark.asyncio
+async def test_clear_completed_keeps_file_when_deletion_disabled(auth_env):
+    from ytdl import DownloadQueue, _download_info_from_record
+    dl_dir = auth_env["dl_dir"]
+    main.config.DELETE_FILE_ON_TRASHCAN = "false"
+
+    dq = DownloadQueue(main.config, AsyncMock())
+    alice_dir = os.path.join(dl_dir, "alice")
+    os.makedirs(alice_dir, exist_ok=True)
+    video_path = os.path.join(alice_dir, "video.mp4")
+    with open(video_path, "w") as f:
+        f.write("dummy")
+
+    info = _download_info_from_record({
+        "id": "https://example.com/v2",
+        "url": "https://example.com/v2",
+        "title": "Test Video 2",
+        "quality": "best",
+        "download_type": "video",
+        "codec": "auto",
+        "format": "any",
+        "folder": "",
+        "status": "finished",
+        "filename": "video.mp4",
+        "user": "alice",
+    })
+    fake_dl = MagicMock()
+    fake_dl.info = info
+    await dq.done.put(fake_dl)
+
+    assert os.path.exists(video_path) is True
+    await dq.clear(["https://example.com/v2"], for_user="alice")
+    assert os.path.exists(video_path) is True
+    assert not dq.done.exists("https://example.com/v2")
